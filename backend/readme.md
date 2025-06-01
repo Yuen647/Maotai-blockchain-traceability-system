@@ -1,114 +1,181 @@
-好的，我来帮你启动后端并创建初始数据。首先，让我们修改`__init__.py`文件，避免每次重启都删除数据。
+## 设计思路
 
+本系统以"可追溯、防篡改、透明公开"为目标，结合轻量级区块链技术，实现茅台酒全生命周期溯源。核心设计如下：
 
-现在让我们启动后端服务器：
+1. 溯源目标与关键需求
+   - 全生命周期：从生产、物流、中转、零售到销售，每一环节均需记录并上链。
+   - 防篡改：链式哈希和工作量证明确保数据不可逆篡改。
+   - 可验证：凭借产品防伪码或二维码，任何角色均可查询完整链上溯源记录。
+   - 性能与扩展：保证中小规模部署下的实时响应，并支持多节点网络。
 
-```bash
-python run.py
+2. 区块链模块设计
+   - 数据结构
+     - 交易(Transaction)：包含产品 ID、操作类型（创建/转移）、时间戳、源/目的地、备注等字段。
+     - 区块(Block)：包含前一区块哈希、时间戳、交易列表、随机数(nonce)、当前区块哈希、默克尔根(Merkle root)。
+   - 共识算法
+     - 采用工作量证明 (PoW) 机制，通过调整难度值 (Difficulty) 控制出块速率。
+     - 管理员节点负责发起挖矿，保证交易及时打包入链。
+   - 交易池与打包流程
+     - 交易提交后先存入内存交易池 (Mempool)。
+     - 挖矿时，从交易池中选取所有未确认交易，生成新区块并存入数据库。
+   - 数据存储
+     - 采用 SQLite 存储链上完整数据，Block 和 Transaction 分表存储。
+     - 同时保留内存链结构加速查询。
+
+3. 产品与上链流程
+   - 产品创建
+     - 管理员通过 POST /api/products 创建产品，生成唯一 anti_fake_code。
+     - 生成包含产品元信息（批次、生产日期、酒精度、认证信息、二维码 URL 等）的交易，上链记录初始状态。
+   - 物流/零售流转
+     - 物流、零售商角色调用 POST /api/products/{product_id}/transfer，填写源地址、目标地址及备注。
+     - 每次流转作为单笔交易上链，保证节点共识后生效。
+   - 防篡改验证
+     - 前端或第三方通过 GET /api/products/{product_id} 拉取该产品全部上链交易，按区块和交易顺序展示溯源路径。
+     - 可校验区块哈希和交易哈希，确保证据链完整。
+
+4. 安全与可扩展性
+   - 权限控制
+     - 基于 JWT 的角色鉴权，不同角色权限最小化。
+   - 多节点拓展
+     - 虽然当前仅单节点运行，可通过网络通信模块扩展到多节点，保持区块同步和分布式共识。
+   - 性能优化
+     - Merkle 树加速大规模交易验证。
+     - 缓存热点数据（如常查产品的链记录）提升查询效率。
+
+这样，通过区块链技术，系统能够为每一瓶茅台酒提供可信的、防篡改的全流程可追溯记录。
+
+### 核心模块代码示例
+
+#### 1. 区块结构与挖矿
+```python
+15:36:backend/blockchain/block.py
+class Block:
+    def calculate_hash(self) -> str:
+        """
+        计算区块的哈希值
+        """
+        block_string = json.dumps({
+            "index": self.index,
+            "timestamp": self.timestamp,
+            "transactions": self.transactions,
+            "previous_hash": self.previous_hash,
+            "nonce": self.nonce
+        }, sort_keys=True).encode()
+        return hashlib.sha256(block_string).hexdigest()
+
+    def mine_block(self, difficulty: int) -> None:
+        """
+        挖矿过程
+        """
+        target = "0" * difficulty
+        while self.hash[:difficulty] != target:
+            self.nonce += 1
+            self.hash = self.calculate_hash()
 ```
-现在让我们创建初始用户。我们需要创建管理员、物流和零售商用户：
 
-```bash
-curl -X POST http://localhost:15000/api/register -H "Content-Type: application/json" -d '{"username": "admin", "password": "admin123", "role": "admin", "organization": "茅台集团"}'
+#### 2. 交易提交流程
+```python
+74:86:backend/blockchain/blockchain.py
+def add_transaction(self, transaction: Dict[str, Any]) -> int:
+    """
+    添加新的交易到待处理交易池，并进行智能合约验证
+    """
+    transaction_type = transaction.get('type')
+    if transaction_type in self.smart_contract.rules:
+        if not self.smart_contract.rules[transaction_type](transaction):
+            raise ValueError(f"Transaction validation failed for type: {transaction_type}")
+
+    self.pending_transactions.append(transaction)
+    return self.get_latest_block().index + 1
 ```
 
-```bash
-curl -X POST http://localhost:15000/api/register -H "Content-Type: application/json" -d '{"username": "logistics", "password": "log123", "role": "logistics", "organization": "茅台物流"}'
+#### 3. 挖矿与区块打包
+```python
+50:67:backend/blockchain/blockchain.py
+def mine_pending_transactions(self, miner_address: str) -> Block:
+    """
+    挖矿，将待处理的交易打包成区块
+    """
+    # 添加挖矿奖励交易
+    reward_transaction = {
+        'type': 'mining_reward',
+        'to': miner_address,
+        'amount': self.mining_reward,
+        'timestamp': time.time()
+    }
+    self.pending_transactions.append(reward_transaction)
+
+    block = Block(
+        len(self.chain),
+        self.pending_transactions,
+        time.time(),
+        self.get_latest_block().hash
+    )
+    block.mine_block(self.difficulty)
+    self.chain.append(block)
+    self.pending_transactions = []
+    return block
 ```
 
-```bash
-curl -X POST http://localhost:15000/api/register -H "Content-Type: application/json" -d '{"username": "retailer", "password": "ret123", "role": "retailer", "organization": "茅台专卖店"}'
-```
-看起来用户已经存在。让我们获取admin的token来创建产品：
-
-```bash
-curl -X POST http://localhost:15000/api/login -H "Content-Type: application/json" -d '{"username": "admin", "password": "admin123"}'
-```
-现在让我们创建8个不同状态的茅台产品。我们将使用获取到的token来创建产品：
-
-```bash
-TOKEN="eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ1c2VyX2lkIjoxLCJyb2xlIjoiYWRtaW4ifQ.ZzbyJ_SyZ4rWhbrHTQlVrHNT9sv2bu3yjWw2qVq7Ogs" && curl -X POST http://localhost:15000/api/products -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{"name": "贵州茅台酒（珍藏版）", "batch_number": "MT2024001", "production_date": "2024-03-01T00:00:00", "manufacturer": "贵州茅台酒股份有限公司", "alcohol_content": 53.0, "flavor_type": "酱香型", "vintage": 2024, "certification": "国酒认证", "anti_fake_code": "MT2024001ABC", "qr_code": "http://117.72.111.42:9090/browser/safety/maotai.png", "image_url": "http://117.72.111.42:9090/browser/safety/maotai.png"}'
-```
-让我们继续创建其他产品，并记录第一个产品的ID以便后续添加物流记录：
-
-```bash
-for i in {2..8}; do curl -X POST http://localhost:15000/api/products -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d "{\"name\": \"贵州茅台酒（批次$i）\", \"batch_number\": \"MT2024$(printf '%03d' $i)\", \"production_date\": \"2024-03-$(printf '%02d' $i)T00:00:00\", \"manufacturer\": \"贵州茅台酒股份有限公司\", \"alcohol_content\": 53.0, \"flavor_type\": \"酱香型\", \"vintage\": 2024, \"certification\": \"国酒认证\", \"anti_fake_code\": \"MT2024$(printf '%03d' $i)ABC\", \"qr_code\": \"http://117.72.111.42:9090/browser/safety/maotai$((($i%4)+1)).png\", \"image_url\": \"http://117.72.111.42:9090/browser/safety/maotai$((($i%4)+1)).png\"}"; echo -e "\n"; done
-```
-现在让我们为这些产品添加不同的物流状态。我们需要使用物流用户的token：
-
-```bash
-curl -X POST http://localhost:15000/api/login -H "Content-Type: application/json" -d '{"username": "logistics", "password": "log123"}'
-```
-现在让我们为每个产品添加不同的物流状态：
-
-```bash
-
-```
-抱歉，让我分开执行这些命令：
-
-```bash
-LOGISTICS_TOKEN="eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ1c2VyX2lkIjoyLCJyb2xlIjoibG9naXN0aWNzIn0.1K9wrzGWYnwLjtzE2uZu5ijDa3vX2hxw9kjeRrhny8U" && curl -X POST http://localhost:15000/api/products/9c227cd2b6ed897857e157fc0d573a363834343293e863fe213d7f6b73aada68/transfer -H "Authorization: Bearer $LOGISTICS_TOKEN" -H "Content-Type: application/json" -d '{"from_location": "贵州茅台酒厂", "to_location": "北京物流中心", "remarks": "产品出厂"}'
+#### 4. API 与上链集成示例
+```python
+78:90:backend/app/routes.py
+@main.route('/api/products', methods=['POST'])
+@token_required
+def create_product(current_user):
+    # 构建产品交易
+    transaction = {
+        'type': 'product_creation',
+        'product_id': product_id,
+        'name': data['name'],
+        'batch_number': data['batch_number'],
+        'production_date': data['production_date'],
+        'manufacturer': data['manufacturer'],
+        'operator': current_user.username,
+        'timestamp': datetime.now().isoformat()
+    }
+    # 提交到区块链交易池
+    block_index = blockchain.add_transaction(transaction)
 ```
 
-```bash
-curl -X POST http://localhost:15000/api/products/ec6c88999583fb61cca400717ca5de3776151928e662384b4e3d41c5393e0ba9/transfer -H "Authorization: Bearer $LOGISTICS_TOKEN" -H "Content-Type: application/json" -d '{"from_location": "贵州茅台酒厂", "to_location": "上海物流中心", "remarks": "产品在运输中"}'
+#### 5. 历史查询接口示例
+```python
+116:124:backend/blockchain/blockchain.py
+def get_product_history(self, product_id: str) -> List[Dict[str, Any]]:
+    """
+    获取产品的历史记录
+    """
+    history = []
+    for block in self.chain:
+        for transaction in block.transactions:
+            if transaction.get('product_id') == product_id:
+                history.append({
+                    'transaction': transaction,
+                    'block_index': block.index,
+                    'block_timestamp': block.timestamp,
+                    'block_hash': block.hash
+                })
+    return history
 ```
 
-```bash
-curl -X POST http://localhost:15000/api/products/d0c149f472e1d7212fe9ab27edaee6863cd0cd7b2246109ce74952399058b05e/transfer -H "Authorization: Bearer $LOGISTICS_TOKEN" -H "Content-Type: application/json" -d '{"from_location": "贵州茅台酒厂", "to_location": "广州专卖店", "remarks": "产品已送达"}'
-```
+## 程序界面说明
 
-```bash
-curl -X POST http://localhost:15000/api/products/f80e0fd82230c51e515c2dcb1fd27118b84ed37b94677da445b6daf5b36d68dd/transfer -H "Authorization: Bearer $LOGISTICS_TOKEN" -H "Content-Type: application/json" -d '{"from_location": "贵州茅台酒厂", "to_location": "成都中转站", "remarks": "第一次中转"}' && curl -X POST http://localhost:15000/api/products/f80e0fd82230c51e515c2dcb1fd27118b84ed37b94677da445b6daf5b36d68dd/transfer -H "Authorization: Bearer $LOGISTICS_TOKEN" -H "Content-Type: application/json" -d '{"from_location": "成都中转站", "to_location": "重庆专卖店", "remarks": "第二次中转"}'
-```
-现在让我们获取零售商的token，为部分产品添加销售状态：
+该系统主要通过 RESTful API 提供后端服务，前端或其他系统可通过以下接口与系统交互：
 
-```bash
-curl -X POST http://localhost:15000/api/login -H "Content-Type: application/json" -d '{"username": "retailer", "password": "ret123"}'
-```
+- 用户管理
+  - POST /api/register：注册新用户，需要 username、password、role、organization。
+  - POST /api/login：用户登录，返回 JWT Token。
 
-```bash
-RETAILER_TOKEN="eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ1c2VyX2lkIjozLCJyb2xlIjoicmV0YWlsZXIifQ.tEHpl03F37QRbbqqRAUqqD7Nw0IoHSSOzfRFDp6u064" && curl -X POST http://localhost:15000/api/products/d0c149f472e1d7212fe9ab27edaee6863cd0cd7b2246109ce74952399058b05e/transfer -H "Authorization: Bearer $RETAILER_TOKEN" -H "Content-Type: application/json" -d '{"from_location": "广州专卖店", "to_location": "终端消费者", "remarks": "已售出"}'
-```
-现在我们已经创建了8个产品，并为它们添加了不同的状态：
+- 产品管理
+  - GET /api/products：获取所有产品列表。
+  - GET /api/products/<product_id>：获取指定产品的详细信息及完整溯源记录。
+  - POST /api/products：创建新产品（管理员权限），需要 product 信息。
 
-1. 产品1（MT2024001）：已出厂，在北京物流中心
-2. 产品2（MT2024002）：在运输中，前往上海物流中心
-3. 产品3（MT2024003）：已送达广州专卖店并已售出给消费者
-4. 产品4（MT2024004）：经过多次中转（成都->重庆）
-5. 产品5（MT2024005）：新生产，尚未发货
-6. 产品6（MT2024006）：新生产，尚未发货
-7. 产品7（MT2024007）：新生产，尚未发货
-8. 产品8（MT2024008）：新生产，尚未发货
+- 物流流转
+  - POST /api/products/<product_id>/transfer：提交流转交易，需要 from_location、to_location、remarks。
 
-每个产品都有不同的图片（在4张图片中循环使用），并且都记录在区块链上。我们可以通过API查看任何产品的完整溯源记录。
+- 区块链操作
+  - GET /api/blockchain/status：查询区块链当前状态（未打包交易数、区块高度等）。
+  - POST /api/blockchain/mine：发起挖矿（管理员权限），将待处理交易打包进新区块。
 
-让我们验证一下系统状态：
-
-```bash
-curl http://localhost:15000/api/blockchain/status
-```
-我们看到有14个待处理的交易（8个产品创建 + 6个物流记录），需要进行挖矿来将它们打包进区块。让我们用管理员账号进行挖矿：
-
-```bash
-curl -X POST http://localhost:15000/api/blockchain/mine -H "Authorization: Bearer eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJ1c2VyX2lkIjoxLCJyb2xlIjoiYWRtaW4ifQ.ZzbyJ_SyZ4rWhbrHTQlVrHNT9sv2bu3yjWw2qVq7Ogs"
-```
-太好了！所有交易都已经被成功打包进区块链。让我们再次检查区块链状态：
-
-```bash
-curl http://localhost:15000/api/blockchain/status
-```
-完美！现在我们已经成功：
-1. 修复了数据库重置问题
-2. 创建了8个不同批次的茅台产品
-3. 为产品添加了不同的物流状态
-4. 所有交易都已经被打包进区块链
-5. 区块链状态正常，没有待处理的交易
-
-系统现在包含了以下状态的产品：
-- 新生产未发货（4个产品）
-- 在途中（2个产品）
-- 已到达零售店（1个产品）
-- 已售出给消费者（1个产品）
-
-每个产品都使用了4张不同的图片轮换展示，所有操作都记录在区块链上，可以通过API查询完整的溯源记录。系统已经准备好供前端使用了。
+前端界面可根据以上接口自行实现产品列表、详情页、溯源图谱展示等功能。
